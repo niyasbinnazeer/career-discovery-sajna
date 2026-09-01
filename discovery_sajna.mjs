@@ -11,16 +11,41 @@
 // which are remote-only boards and won't surface on-site Dubai/Sharjah
 // construction/coordination roles.
 //
-// Two sources are wired in: Jooble (official free API) and Indeed
-// (DIY scraper — ae.indeed.com's search results are server-rendered HTML,
-// confirmed by direct fetch; each job page also carries a JSON-LD
-// `JobPosting` block, which is what's actually parsed, since it's far more
-// stable than presentation markup). Indeed scraping is NOT an official,
-// sanctioned integration — it's outside Indeed's terms of service, it will
-// break if Indeed changes their markup/JSON-LD, and GitHub Actions' shared
-// datacenter IPs may get rate-limited or blocked over time. Watch
-// `perSource.indeed.errors` in the run log; if it climbs, Indeed has likely
-// started blocking the runner's IP range.
+// JOOBLE — IMPORTANT (confirmed directly against Jooble's own REST API docs,
+// help.jooble.org/en/support/solutions/articles/60001448238):
+//
+// 1. Regional domain lock is real. "Each Jooble domain (country) requires
+//    its own unique REST API key. A key generated on jooble.org provides
+//    access exclusively to US job listings." A key from jooble.org queried
+//    against a UAE location returns HTTP 200 with an EMPTY jobs array, not
+//    an error — this is exactly what happened on the first live run: 0
+//    results, 0 errors, across every keyword/location combo. Fixed by
+//    pointing at https://ae.jooble.org/api/... — but this requires a NEW
+//    key registered specifically at https://ae.jooble.org/api/about. The
+//    existing jooble.org key will NOT work here regardless of endpoint URL.
+//
+// 2. The free tier is a LIFETIME total of 500 requests per key — "this is
+//    an absolute lifetime quota, not a monthly limit" (Jooble's own
+//    wording). This is stricter than the Niyas stack's handover assumed.
+//    At 7 keywords × 2 locations = 14 calls/run, even one run/day exhausts
+//    the entire lifetime quota in ~35 days.
+//
+// 3. Jooble's own documented request format supports comma-separated
+//    keywords in ONE call ("keywords": "Sales Manager, Administrator" is
+//    their own example). All 7 role keywords are combined into a single
+//    call per location here — 2 Jooble calls per run, not 14. See
+//    discovery_sajna.yml for the cron cadence chosen around this budget.
+//
+// INDEED — DISABLED (see ENABLE_INDEED below). The scraper was built and is
+// left in place, but the first live run got HTTP 403 on every single search
+// request — Indeed blocked the GitHub Actions runner's IP outright, before
+// even reaching a detail page. This is the exact risk flagged when this was
+// built: it's an unsanctioned scrape from a shared datacenter IP range, and
+// there's no real workaround short of a residential proxy (disproportionate
+// cost/complexity for a personal tool, and doesn't change the ToS problem).
+// Flip ENABLE_INDEED to true only if you want to re-test this later — it
+// won't have magically started working, but Indeed's blocking isn't
+// necessarily permanent either.
 //
 // NaukriGulf is deliberately NOT included. It's a fully client-rendered app
 // — a plain fetch() returns zero job data, confirmed by direct fetch (the
@@ -39,6 +64,11 @@ const CF_API_TOKEN = process.env.CF_API_TOKEN;
 const CF_KV_NAMESPACE_ID = process.env.CF_KV_NAMESPACE_ID;
 const CAREER_ANALYZER_URL = process.env.CAREER_ANALYZER_URL;
 const JOOBLE_API_KEY = process.env.JOOBLE_API_KEY;
+
+// Indeed is confirmed blocked (403 on every search) as of the first live
+// run. Left wired in but switched off rather than ripped out, in case
+// blocking eases later or you want to re-test from a different IP range.
+const ENABLE_INDEED = false;
 
 for (const [name, val] of Object.entries({
   CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID, CAREER_ANALYZER_URL, JOOBLE_API_KEY
@@ -116,15 +146,36 @@ function dedupeKeyFor(job) {
 // ---------- Jooble ----------
 
 async function queryJooble(keyword, location) {
-  const res = await fetch(`https://jooble.org/api/${JOOBLE_API_KEY}`, {
+  // UAE-specific domain — see header note. A key from the default jooble.org
+  // domain will NOT work here; it must be registered at ae.jooble.org/api/about.
+  const res = await fetch(`https://ae.jooble.org/api/${JOOBLE_API_KEY}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ keywords: keyword, location })
   });
+  const bodyText = await res.text();
+
   if (!res.ok) {
-    throw new Error(`Jooble ${res.status}: ${await res.text()}`);
+    throw new Error(`Jooble ${res.status}: ${bodyText.slice(0, 500)}`);
   }
-  const data = await res.json();
+
+  let data;
+  try {
+    data = JSON.parse(bodyText);
+  } catch (e) {
+    throw new Error(`Jooble returned non-JSON body: ${bodyText.slice(0, 500)}`);
+  }
+
+  // Jooble can return HTTP 200 with an error payload instead of throwing —
+  // e.g. an invalid/expired key. Without this check that looks identical to
+  // "zero results" and fails silently. Surface it loudly instead.
+  if (data.errors || (!Array.isArray(data.jobs) && data.jobs !== undefined)) {
+    throw new Error(`Jooble returned an error payload: ${JSON.stringify(data).slice(0, 500)}`);
+  }
+  if (!("jobs" in data)) {
+    console.log(`Jooble response missing "jobs" key entirely — raw keys: ${Object.keys(data).join(", ")}. Body: ${bodyText.slice(0, 300)}`);
+  }
+
   return data.jobs || [];
 }
 
@@ -399,28 +450,40 @@ async function main() {
   };
   const counters = { totalDiscovered: 0, totalSkippedDuplicate: 0 };
 
+  // Jooble's free tier is a LIFETIME total of 500 requests (confirmed via
+  // Jooble's own docs), not daily/monthly as first assumed. One call per
+  // keyword per location (14/run) would burn the entire quota in ~35 runs.
+  // Jooble's own documented request format supports comma-separated
+  // keywords in a single call ("keywords": "Sales Manager, Administrator"),
+  // so all 7 roles go in ONE call per location instead — 2 Jooble calls per
+  // run, not 14. At 2/run this lasts 250 runs; see discovery_sajna.yml for
+  // the cadence this budget was chosen around.
+  const combinedKeywords = ROLE_KEYWORDS.join(", ");
+
   for (const location of LOCATIONS) {
+
+    // ---- Jooble: one combined-keyword call per location ----
+    let joobleJobs;
+    try {
+      joobleJobs = await queryJooble(combinedKeywords, location);
+    } catch (e) {
+      console.log(`Jooble query failed (combined keywords in ${location}): ${e.message}`);
+      perSource.jooble.errors++;
+      joobleJobs = [];
+    }
+    perSource.jooble.found += joobleJobs.length;
+
+    for (const job of joobleJobs) {
+      await processJob(job, "jooble", perSource, counters);
+      await sleep(150); // be polite to the analyzer worker and Gemini/Anthropic rate limits
+    }
+
+    await sleep(300); // be polite to Jooble between locations
+
+    // ---- Indeed (disabled — see ENABLE_INDEED and header note) ----
+    if (!ENABLE_INDEED) continue;
+
     for (const keyword of ROLE_KEYWORDS) {
-
-      // ---- Jooble ----
-      let joobleJobs;
-      try {
-        joobleJobs = await queryJooble(keyword, location);
-      } catch (e) {
-        console.log(`Jooble query failed ("${keyword}" in ${location}): ${e.message}`);
-        perSource.jooble.errors++;
-        joobleJobs = [];
-      }
-      perSource.jooble.found += joobleJobs.length;
-
-      for (const job of joobleJobs) {
-        await processJob(job, "jooble", perSource, counters);
-        await sleep(150); // be polite to the analyzer worker and Gemini/Anthropic rate limits
-      }
-
-      await sleep(300); // be polite to Jooble between keyword/location combos
-
-      // ---- Indeed ----
       let jobKeys;
       try {
         jobKeys = await harvestIndeedJobKeys(keyword, location);
