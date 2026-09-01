@@ -2,10 +2,18 @@ name: Career Discovery (Sajna)
 
 on:
   schedule:
-    # Every 3 hours. Single source (Jooble) and a narrower location set than
-    # the Niyas stack, so a tighter cron isn't needed — adjust if you want
-    # faster turnaround on new postings.
-    - cron: '0 */3 * * *'
+    # Once daily, 06:00 UTC (10:00 AM Gulf Standard Time).
+    #
+    # Jooble's free tier is a LIFETIME total of 500 requests per key — not
+    # daily/monthly (confirmed against Jooble's own docs). This script makes
+    # 2 Jooble calls per run (one per location, keywords combined into a
+    # single comma-separated call). At 2 calls/run:
+    #   - once daily  -> ~250 days of runway (~8 months)
+    #   - every 3 hrs (8x/day) -> exhausted in ~31 days
+    # Once daily was chosen to actually last through a job search that could
+    # run for months. Manual runs via workflow_dispatch also spend this same
+    # budget — use those sparingly once this is live, not for routine checks.
+    - cron: '0 6 * * *'
   workflow_dispatch: {}
 
 jobs:
