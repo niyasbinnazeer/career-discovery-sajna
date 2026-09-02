@@ -582,7 +582,28 @@ export default {
             appliedAt: null,
             modelUsed
           };
-          await env.JOBS_KV.put(`jobs:${id}`, JSON.stringify(record));
+          const metadata = {
+            id,
+            timestamp: record.timestamp,
+            url: pageUrl,
+            pageTitle: pageTitle,
+            directApplyUrl,
+            status: "new",
+            modelUsed,
+            actualRole: analysis.actualRole || "",
+            company: analysis.company || "",
+            location: analysis.location || "",
+            country: analysis.country || "",
+            experienceRequired: analysis.experienceRequired || "",
+            employmentType: analysis.employmentType || "",
+            matchScore: analysis.matchScore || 0,
+            recommendation: analysis.recommendation || "",
+            resumeVersion: analysis.resumeVersion || "",
+            companySignal: analysis.companySignal || "",
+            topStrength: (analysis.strengths || [])[0] || "",
+            topGap: (analysis.gaps || [])[0] || ""
+          };
+          await env.JOBS_KV.put(`jobs:${id}`, JSON.stringify(record), { metadata });
           savedId = id;
         }
       } catch (e) {
