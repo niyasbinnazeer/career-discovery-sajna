@@ -2,18 +2,17 @@ name: Career Discovery (Sajna)
 
 on:
   schedule:
-    # Once daily, 06:00 UTC (10:00 AM Gulf Standard Time).
+    # Twice daily, 06:00 and 14:00 UTC (10:00 AM and 6:00 PM Gulf Standard Time).
     #
     # Jooble's free tier is a LIFETIME total of 500 requests per key — not
     # daily/monthly (confirmed against Jooble's own docs). This script makes
     # 2 Jooble calls per run (one per location, keywords combined into a
-    # single comma-separated call). At 2 calls/run:
-    #   - once daily  -> ~250 days of runway (~8 months)
-    #   - every 3 hrs (8x/day) -> exhausted in ~31 days
-    # Once daily was chosen to actually last through a job search that could
-    # run for months. Manual runs via workflow_dispatch also spend this same
+    # single comma-separated call). At 2 calls/run, 2 runs/day = 4 calls/day:
+    #   - twice daily  -> ~125 days of runway (~4 months)
+    #   - once daily    -> ~250 days of runway (~8 months)
+    # Manual runs via workflow_dispatch also spend this same
     # budget — use those sparingly once this is live, not for routine checks.
-    - cron: '0 6 * * *'
+    - cron: '0 6,14 * * *'
   workflow_dispatch: {}
 
 jobs:
