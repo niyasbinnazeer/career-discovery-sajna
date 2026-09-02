@@ -33,4 +33,5 @@ jobs:
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CAREER_ANALYZER_URL: ${{ secrets.CAREER_ANALYZER_URL }}
           JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: node discovery_sajna.mjs

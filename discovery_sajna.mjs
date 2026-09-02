@@ -64,7 +64,10 @@ const CF_API_TOKEN = process.env.CF_API_TOKEN;
 const CF_KV_NAMESPACE_ID = process.env.CF_KV_NAMESPACE_ID;
 const CAREER_ANALYZER_URL = process.env.CAREER_ANALYZER_URL;
 const JOOBLE_API_KEY = process.env.JOOBLE_API_KEY;
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY; // Optional: enables JSearch (Google for Jobs)
 
+const ENABLE_LINKEDIN = true;
+const ENABLE_JSEARCH = true;
 // Indeed is confirmed blocked (403 on every search) as of the first live
 // run. Left wired in but switched off rather than ripped out, in case
 // blocking eases later or you want to re-test from a different IP range.
@@ -229,6 +232,129 @@ function stripHtml(html) {
     .replace(/&quot;/gi, '"')
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// ---------- LinkedIn Jobs (Public Guest Search — No API Key Required) ----------
+
+async function searchLinkedIn(keywordsQuery, location) {
+  const url = `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=${encodeURIComponent(keywordsQuery)}&location=${encodeURIComponent(location)}`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": BROWSER_UA,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9"
+    }
+  });
+
+  if (!res.ok) {
+    throw new Error(`LinkedIn search ${res.status}`);
+  }
+
+  const html = await res.text();
+  const jobs = [];
+
+  const linkMatches = [...html.matchAll(/<a[^>]*class=["'][^"']*base-card__full-link[^"']*["'][^>]*href=["']([^"']+)["']/gi)];
+  const titleMatches = [...html.matchAll(/<h3[^>]*class=["'][^"']*base-search-card__title[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\/h3>/gi)];
+  const compMatches = [...html.matchAll(/<h4[^>]*class=["'][^"']*base-search-card__subtitle[^"']*["'][^>]*>[\s\S]*?<a[^>]*>\s*([\s\S]*?)\s*<\/a>/gi)];
+  const locMatches = [...html.matchAll(/<span[^>]*class=["'][^"']*job-search-card__location[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\/span>/gi)];
+
+  for (let i = 0; i < linkMatches.length; i++) {
+    const rawLink = linkMatches[i][1];
+    const idMatch = rawLink.match(/-(\d+)(?:\?|$)/);
+    if (!idMatch) continue;
+
+    const jobId = idMatch[1];
+    const cleanLink = `https://ae.linkedin.com/jobs/view/${jobId}`;
+    const title = titleMatches[i] ? stripHtml(titleMatches[i][1]) : "";
+    const company = compMatches[i] ? stripHtml(compMatches[i][1]) : "";
+    const loc = locMatches[i] ? stripHtml(locMatches[i][1]) : location;
+
+    jobs.push({
+      id: jobId,
+      title,
+      company,
+      location: loc,
+      link: cleanLink
+    });
+  }
+
+  return jobs;
+}
+
+async function fetchLinkedInDetail(jobId) {
+  const url = `https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/${jobId}`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": BROWSER_UA,
+      "Accept-Language": "en-US,en;q=0.9"
+    }
+  });
+
+  if (!res.ok) {
+    throw new Error(`LinkedIn detail ${res.status}`);
+  }
+
+  const html = await res.text();
+
+  const descMatch = html.match(/<div[^>]*class=["'][^"']*show-more-less-html__markup[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+  const snippet = descMatch ? stripHtml(descMatch[1]).slice(0, 4000) : "";
+
+  const typeMatch = html.match(/<span[^>]*class=["'][^"']*description__job-criteria-text[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\/span>/i);
+  const type = typeMatch ? stripHtml(typeMatch[1]) : "";
+
+  const dateMatch = html.match(/<span[^>]*class=["'][^"']*posted-time-ago__text[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\/span>/i);
+  const updated = dateMatch ? stripHtml(dateMatch[1]) : "";
+
+  return { snippet, type, updated };
+}
+
+// ---------- JSearch (Google for Jobs via RapidAPI) ----------
+
+async function queryJSearch(keywordsQuery, location) {
+  if (!RAPIDAPI_KEY) {
+    return null;
+  }
+
+  const fullQuery = `${keywordsQuery} in ${location}, UAE`;
+  const url = `https://jsearch.p.rapidapi.com/search?query=${encodeURIComponent(fullQuery)}&page=1&num_pages=1&date_posted=all`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      "x-rapidapi-key": RAPIDAPI_KEY,
+      "x-rapidapi-host": "jsearch.p.rapidapi.com"
+    }
+  });
+
+  if (!res.ok) {
+    throw new Error(`JSearch ${res.status}: ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  const rawList = Array.isArray(data.data) ? data.data : [];
+
+  return rawList.map(item => {
+    let salary = "";
+    if (item.job_min_salary && item.job_max_salary) {
+      salary = `${item.job_salary_currency || "AED"} ${item.job_min_salary} - ${item.job_max_salary}`;
+    } else if (item.job_min_salary) {
+      salary = `${item.job_salary_currency || "AED"} ${item.job_min_salary}`;
+    }
+
+    const loc = item.job_city ? `${item.job_city}, ${item.job_country || "UAE"}` : location;
+
+    return {
+      title: item.job_title || "",
+      company: item.employer_name || "",
+      location: loc,
+      link: item.job_apply_link || item.job_google_link || "",
+      salary,
+      type: item.job_employment_type || "",
+      updated: item.job_posted_at_datetime_utc || "",
+      snippet: (item.job_description || "").slice(0, 4000),
+      directApplyCandidate: item.job_apply_link || null
+    };
+  });
 }
 
 // Fetches one job's canonical page and pulls its JSON-LD JobPosting block.
@@ -460,6 +586,8 @@ async function processJob(job, sourceName, perSource, counters) {
 async function main() {
   const perSource = {
     jooble: { found: 0, new: 0, belowFloor: 0, analyzed: 0, errors: 0 },
+    linkedin: { found: 0, new: 0, belowFloor: 0, analyzed: 0, errors: 0, skippedAlreadySeenBeforeFetch: 0 },
+    jsearch: { found: 0, new: 0, belowFloor: 0, analyzed: 0, errors: 0 },
     indeed: { found: 0, new: 0, belowFloor: 0, analyzed: 0, errors: 0, skippedAlreadySeenBeforeFetch: 0 }
   };
   const counters = { totalDiscovered: 0, totalSkippedDuplicate: 0 };
@@ -493,6 +621,96 @@ async function main() {
     }
 
     await sleep(300); // be polite to Jooble between locations
+
+    // ---- LinkedIn Jobs (Public Guest API — no key required) ----
+    if (ENABLE_LINKEDIN) {
+      const linkedInQueries = [
+        '"quantity surveyor" OR "junior quantity surveyor" OR "geotechnical engineer"',
+        '"document controller" OR "project coordinator" OR "client coordinator" OR "admin assistant"'
+      ];
+
+      for (const lQuery of linkedInQueries) {
+        let lSummaries = [];
+        try {
+          lSummaries = await searchLinkedIn(lQuery, location);
+        } catch (e) {
+          console.log(`LinkedIn search failed (${lQuery} in ${location}): ${e.message}`);
+          perSource.linkedin.errors++;
+          lSummaries = [];
+        }
+        perSource.linkedin.found += lSummaries.length;
+
+        for (const lSummary of lSummaries) {
+          const dedupeKey = dedupeKeyFor(lSummary);
+          let alreadySeen;
+          try {
+            alreadySeen = await kvKeyExists(dedupeKey);
+          } catch (e) {
+            continue;
+          }
+          if (alreadySeen) {
+            perSource.linkedin.skippedAlreadySeenBeforeFetch++;
+            counters.totalSkippedDuplicate++;
+            continue;
+          }
+
+          let detail = { snippet: "", type: "", updated: "" };
+          try {
+            detail = await fetchLinkedInDetail(lSummary.id);
+          } catch (e) {
+            console.log(`LinkedIn detail fetch failed for ${lSummary.id}: ${e.message}`);
+            perSource.linkedin.errors++;
+            await sleep(350);
+            continue;
+          }
+
+          const fullJob = {
+            title: lSummary.title,
+            company: lSummary.company,
+            location: lSummary.location,
+            link: lSummary.link,
+            salary: "",
+            type: detail.type || "Full-time",
+            updated: detail.updated || "",
+            snippet: detail.snippet || lSummary.title
+          };
+
+          await processJob(fullJob, "linkedin", perSource, counters);
+          await sleep(350); // polite delay
+        }
+
+        await sleep(500); // polite delay between LinkedIn query passes
+      }
+    }
+
+    // ---- JSearch (Google for Jobs via RapidAPI) ----
+    if (ENABLE_JSEARCH) {
+      if (!RAPIDAPI_KEY) {
+        if (location === LOCATIONS[0]) {
+          console.log("[JSearch] RAPIDAPI_KEY not configured in environment — skipping JSearch (optional Google for Jobs integration).");
+        }
+      } else {
+        const jsearchQuery = "Civil Engineer OR Quantity Surveyor OR Project Coordinator OR Document Controller";
+        let jJobs = [];
+        try {
+          jJobs = await queryJSearch(jsearchQuery, location);
+        } catch (e) {
+          console.log(`JSearch query failed for ${location}: ${e.message}`);
+          perSource.jsearch.errors++;
+          jJobs = [];
+        }
+
+        if (Array.isArray(jJobs)) {
+          perSource.jsearch.found += jJobs.length;
+          for (const jJob of jJobs) {
+            await processJob(jJob, "jsearch", perSource, counters);
+            await sleep(150);
+          }
+        }
+
+        await sleep(300);
+      }
+    }
 
     // ---- Indeed (disabled — see ENABLE_INDEED and header note) ----
     if (!ENABLE_INDEED) continue;
